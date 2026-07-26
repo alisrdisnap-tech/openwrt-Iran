@@ -1,0 +1,63 @@
+name: Publish an existing Google WiFi build artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Successful build workflow run ID"
+        required: true
+        default: "30199954456"
+        type: string
+      artifact_name:
+        description: "Artifact name from that workflow run"
+        required: true
+        default: "openwrt-google-wifi-25.12.5-passwall2-26.7.16-1"
+        type: string
+      release_tag:
+        description: "New, unique Git tag for this release"
+        required: true
+        default: "gale-openwrt-25.12.5-passwall2-26.7.16-1-manual-30199954456"
+        type: string
+      release_name:
+        description: "Release title"
+        required: true
+        default: "OpenWrt 25.12.5 + Passwall2 26.7.16-1 (Google WiFi AC-1304, build 2026-07-26)"
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download the successful build artifact
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.run_id }}
+          name: ${{ inputs.artifact_name }}
+          path: artifacts
+
+      - name: Verify firmware files
+        run: |
+          set -eu
+          test -s artifacts/openwrt-google-wifi-ac1304-*-factory.bin
+          test -s artifacts/openwrt-google-wifi-ac1304-*-sysupgrade.bin
+          test -s artifacts/sha256sums
+          grep -q '^mwan3 ' artifacts/openwrt-ipq40xx-chromium-google_wifi.manifest
+          grep -q '^luci-app-mwan3 ' artifacts/openwrt-ipq40xx-chromium-google_wifi.manifest
+
+      - name: Publish a new GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.release_name }}
+          make_latest: true
+          body: |
+            Google WiFi AC-1304 (Gale) firmware from successful build run ${{ inputs.run_id }}.
+
+            Includes mwan3 and luci-app-mwan3 with kernel dependencies built for the same firmware ABI.
+          files: artifacts/*
