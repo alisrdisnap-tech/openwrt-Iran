@@ -1,47 +1,61 @@
 #!/bin/sh
 # =============================================================================
-# First-boot setup for the Iran build of OpenWrt + Passwall2 (Google WiFi/Gale)
-#
-# Runs ONCE automatically on first boot, then OpenWrt deletes it (exit 0).
-#
-# IMPORTANT: the filename starts with "zzz-" on purpose. uci-defaults scripts
-# run in sorted order, and Passwall2's own "luci-passwall2" script is what
-# copies /usr/share/passwall2/0_default_config into /etc/config/passwall2
-# (creating the "rulenode" shunt node). "zzz-..." sorts AFTER "luci-..." so by
-# the time we run, the shunt node already exists and we can attach our rule to
-# it. (The old name "99-custom-passwall2" sorted BEFORE it, which silently
-# blocked Passwall2's defaults from ever loading.)
-#
-# It does three things:
-#   1. Creates the "Iran Bypass" shunt rule (Iranian domains + IPs).
-#   2. Attaches that rule to the active shunt node as Direct, so Iranian
-#      traffic bypasses the proxy out of the box -- no clicks needed.
-#   3. Removes the broken Passwall feed URLs from the on-device package feed
-#      list, so `apk update` no longer fails with "error 8 / unexpected end of
-#      file" and no duplicate feeds are left behind.
+# First-boot setup for OpenWrt + Passwall2 (Iran build)
+# Runs ONCE automatically on first boot, then OpenWrt deletes it.
+# Filename should start with "zzz-" so it runs AFTER luci-passwall2.
 # =============================================================================
 
 [ -x /sbin/uci ] || exit 0
 
+# =============================================================================
+# PART 1: Base setup (WiFi / Password / LAN IP)
+# =============================================================================
+
+wlan_name="OpenWrt-2G"
+wlan_password="Asus40xx"
+
+root_password="root"
+
+lan_ip_address="192.168.10.1/24"
+
+exec >/tmp/setup.log 2>&1
+
+if [ -n "$root_password" ]; then
+  (echo "$root_password"; sleep 1; echo "$root_password") | passwd > /dev/null
+fi
+
+if [ -n "$lan_ip_address" ]; then
+  uci set network.lan.ipaddr="$lan_ip_address"
+  uci commit network
+fi
+
+if [ -n "$wlan_name" -a -n "$wlan_password" -a ${#wlan_password} -ge 8 ]; then
+  uci set wireless.@wifi-device[0].disabled='0'
+  uci set wireless.@wifi-iface[0].disabled='0'
+  uci set wireless.@wifi-iface[0].encryption='psk2'
+  uci set wireless.@wifi-iface[0].ssid="$wlan_name"
+  uci set wireless.@wifi-iface[0].key="$wlan_password"
+  uci commit wireless
+fi
+
+echo "Base setup done!"
+
+# =============================================================================
+# PART 2: Passwall2 Iran Bypass
+# =============================================================================
+
 # --- 0) Safety net: make sure Passwall2's default config is present ----------
-# Normally luci-passwall2 already did this. If for any reason it did not, load
-# the defaults now so the shunt node ("rulenode") exists before we touch it.
 if [ ! -s /etc/config/passwall2 ] && [ -f /usr/share/passwall2/0_default_config ]; then
 	cp -f /usr/share/passwall2/0_default_config /etc/config/passwall2
 fi
 
 # --- 1) Create the "Iran Bypass" shunt rule ----------------------------------
-# Domain side: any .ir domain, the Persian IDN TLD (.ایران), and the Iran
-#              geosite category from the embedded geosite_IR.dat.
-# IP side    : the Iran geoip category from the embedded geoip_IR.dat.
-# Both .dat files are shipped at /usr/share/v2ray/ (Xray "ext:" asset path).
 DOMAIN_LIST='regexp:.*\.ir$
 regexp:.*\.xn--mgba3a4f16a$
 ext:geosite_IR.dat:ir'
 
 IP_LIST='ext:geoip_IR.dat:ir'
 
-# Recreate cleanly so re-runs stay idempotent.
 uci -q delete passwall2.IranBypass 2>/dev/null
 
 uci set passwall2.IranBypass='shunt_rules'
@@ -51,9 +65,6 @@ uci set passwall2.IranBypass.domain_list="$DOMAIN_LIST"
 uci set passwall2.IranBypass.ip_list="$IP_LIST"
 
 # --- 2) Attach the rule to every shunt node as Direct (bypass) ---------------
-# On a Passwall2 shunt node, each shunt rule is stored as an option whose KEY
-# is the rule's section name. Value "_direct" = Direct Connection (bypass).
-# We loop over all "_shunt" nodes so it works even if the node was renamed.
 SHUNT_NODES=$(uci show passwall2 2>/dev/null \
 	| sed -n "s/^passwall2\.\([^.]*\)\.protocol='_shunt'\$/\1/p")
 [ -z "$SHUNT_NODES" ] && SHUNT_NODES="rulenode"
@@ -65,11 +76,6 @@ done
 uci commit passwall2
 
 # --- 3) Remove ONLY the broken openwrt.org Passwall feeds --------------------
-# The build can leave two feed URLs that point at downloads.openwrt.org, which
-# does NOT host Passwall packages -> `apk update` fails (error 8 / unexpected
-# end of file). We delete only those. We deliberately KEEP any Passwall repo
-# hosted on sourceforge (openwrt-passwall-build), because that one is the real,
-# working repo -- it just needs its signing key, which we install in step 4.
 for feed_file in \
 	/etc/apk/repositories.d/distfeeds.list \
 	/etc/apk/repositories.d/passwall.list \
@@ -79,21 +85,10 @@ for feed_file in \
 	/etc/opkg/customfeeds.conf
 do
 	[ -f "$feed_file" ] || continue
-	# '#' used as sed delimiter so we don't have to escape '/' in the path.
-	# Remove ALL passwall feed lines here; the correct, de-duplicated set is
-	# (re)written in step 5 below. This clears both the broken
-	# downloads.openwrt.org lines AND any stale/duplicate sourceforge lines.
 	sed -i -e '\#passwall#d' "$feed_file"
 done
 
 # --- 4) Ensure the Passwall apk signing key is present (correct name!) --------
-# CRITICAL: apk (OpenWrt 25.x) matches a repo's signature to a key file whose
-# NAME equals the signer identity. The Passwall repo is signed as
-# "openwrt-passwall-build.pem" -- so the key MUST be at
-#   /etc/apk/keys/openwrt-passwall-build.pem
-# A file named passwall.pub is IGNORED by apk => "UNTRUSTED signature".
-# The build bakes the key in; this heredoc self-heals it if missing, with ZERO
-# network dependency (the key is public, so embedding it is fine).
 PW_KEY="/etc/apk/keys/openwrt-passwall-build.pem"
 if [ ! -s "$PW_KEY" ]; then
 	mkdir -p /etc/apk/keys
@@ -104,17 +99,13 @@ Owy7UzzBIOxrGSAiu1blMeX96Q55Q9PH5GyjPwYiT4nrrwRgIttggGK62w==
 -----END PUBLIC KEY-----
 PWKEY
 fi
-# Remove the wrong-named key if a previous manual fix left one behind.
 rm -f /etc/apk/keys/passwall.pub 2>/dev/null
 
 # --- 5) Write the correct, signed Passwall apk feeds (no duplicates) ---------
-# Uses the device's ACTUAL release + arch so the URLs are always correct.
-# Matches the official openwrt-passwall-build method exactly.
 if [ -f /etc/openwrt_release ]; then
-	# shellcheck disable=SC1091
 	. /etc/openwrt_release
-	PW_REL="${DISTRIB_RELEASE%.*}"   # e.g. 25.12.5 -> 25.12
-	PW_ARCH="${DISTRIB_ARCH}"        # e.g. arm_cortex-a7_neon-vfpv4
+	PW_REL="${DISTRIB_RELEASE%.*}"
+	PW_ARCH="${DISTRIB_ARCH}"
 	if [ -n "$PW_REL" ] && [ -n "$PW_ARCH" ]; then
 		mkdir -p /etc/apk/repositories.d
 		PW_BASE="https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-${PW_REL}/${PW_ARCH}"
